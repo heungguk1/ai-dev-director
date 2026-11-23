@@ -7,6 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from core.bootstrap import prepare_project
 from core.env_utils import resolve_cli, probe_version
 from agents.codex_head import CodexHead
 from agents.claude_head import ClaudeHead
@@ -28,6 +29,9 @@ def main():
             'Reject booleans, negative or non-finite numbers, and nonnumeric values with ValueError. '
             'Add tests/test_profit.py including zero and unknown. Preserve all existing tests. '
             'Only these two paths may change. No external dependencies or network.')
+    # The smoke project used to be assumed; a missing folder failed both probes with misleading errors
+    # (Codex reported "git executable not found"). Create it as a git repo with an empty first commit if needed.
+    prepare_project(PROJECT)
     for domain, cls in [('OPENAI', CodexHead), ('ANTHROPIC', ClaudeHead)]:
         try:
             agent = cls(timeout=180, no_progress_timeout=120)

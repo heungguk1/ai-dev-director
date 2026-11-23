@@ -1,0 +1,386 @@
+# AI DEV DIRECTOR 프로젝트 분석
+
+> 작성일: 2026-11-22 (2026-11-23 보강) · 기준 커밋: `be90907` (v3.2.0)
+> 범위: 핵심 파일, 실행 방법, Claude / Codex / Antigravity CLI가 연결되는 위치와 방식, 대시보드 프런트엔드, CLI 진단
+
+---
+
+## 1. 한 줄 요약
+
+로그인된 **구독형 AI 코딩 CLI**(Claude Code, OpenAI Codex, 선택적으로 Google Antigravity `agy`)를
+**HEAD / BUILDER / REVIEWER** 세 역할로 배치해, 목표 한 줄을 **격리된 git worktree에서 검증·리뷰된 코드**로
+만들어 주는 로컬 오케스트레이터입니다. API 키를 쓰지 않고, 각 CLI를 **서브프로세스로 호출**(stdin으로 프롬프트 전달,
+stdout으로 JSON 수신)하는 방식으로 붙습니다.
+
+- 언어: Python 3.9+ (의존성: `pyyaml`, `click`, `pydantic>=2`, `psutil`, `pytest`)
+- 저장소: SQLite(`data/director.db`) + JSON 파일(run 결과, 미션)
+- UI: 의존성 없는 정적 프런트엔드(`console/`) + Python `http.server` 기반 서버(포트 8081)
+
+---
+
+## 2. 디렉터리 구조와 핵심 파일
+
+```
+director.py              CLI 진입점 (click): run / mission / do / status / resume / clean-worktrees
+companion_server.py      8081 콘솔 서버 (TRINITY 무대, /ops/*, /bridge/* API). dashboard_server를 감싸서 띄움
+dashboard_server.py      (3,200줄) 작업실 화면(/classic), 채팅, 미션 스레드 실행, 상태 요약 — 서버 로직 대부분
+config.yaml              역할별 공급자, 타임아웃, 안전 상한, 검증 명령, 자율 모드/프로필
+companion.json           콘솔 포트(8081), 허용 프로젝트 목록
+
+agents/                  AI CLI 어댑터 (← CLI가 "붙는" 곳)
+  head.py                BaseHead 추상 클래스 + 공용 프롬프트(프록시 정책, ORDER 스키마, plan_next 등)
+  claude_head.py         HEAD = Claude Code CLI
+  codex_head.py          HEAD = Codex CLI
+  google_roles.py        HEAD/REVIEWER = Antigravity(agy) (GoogleHead, GoogleReviewer)
+  claude_reviewer.py     REVIEWER = Claude Code CLI
+  codex_reviewer.py      REVIEWER = Codex CLI
+  proposal_builder.py    BUILDER(proposal 모드, 기본) — codex/claude/agy 중 하나에게 "파일 전체 JSON"을 받아 Director가 씀
+  antigravity_builder.py BUILDER(직접 편집 모드, 레거시) — agy가 worktree 안에서 직접 파일 편집. ProposalBuilder의 부모 클래스
+  mock_head.py           테스트용 Mock HEAD
+
+core/                    오케스트레이션 엔진
+  orchestrator.py        (1,900줄) ★ 단일 run 파이프라인: ORDER → BUILD → VERIFY → REVIEW → DECIDE, 장애 조치
+  mission.py             ★ 미션(여러 마일스톤 run을 HEAD가 계획하며 연속 실행), 정지/재개/자동 반영
+  env_utils.py           ★ CLI 실행 파일 탐색(resolve_cli), 과금 환경 변수 제거, Claude 읽기 전용 플래그
+  process_runner.py      ★ ProcessTreeRunner: 서브프로세스 실행, 타임아웃/무출력 감시, 프로세스 트리 강제 종료
+  research_runner.py     ★ TriadResearchRunner: 3개 CLI 공통 호출기(도메인별 커맨드 조립). Builder·Google 역할도 이걸 씀
+  provider_manager.py    공급자 상태(HEALTHY/RECOVERING/DOWN…), 에러 분류, NORMAL/DEGRADED/STOP 모드, 역할 교체
+  role_settings.py       콘솔에서 바꾼 역할 배치(data/role_settings.json) 적용, 공급자 별칭/도메인 매핑
+  safety.py              Scope Guard: 허용/보호 경로, 파일 수·diff 상한 검사
+  verifier.py            빌드/테스트/린트 명령 실행(격리 worktree에서)
+  git_manager.py         worktree 생성/정리, diff
+  state_machine.py       run 상태 머신(SQLite): IDLE→PLANNING→ORDER_READY→BUILDING→VERIFYING→REVIEWING→DECIDING→PASS/FAIL/HUMAN_REQUIRED/TIMEOUT
+  autopilot.py           사람에게 물어야 하는 정지 조건(결제, 실계좌 주문, 자격증명, 비가역 외부 행동)
+  bootstrap.py / greenfield.py  빈 폴더·비 git 폴더 자동 준비, 스냅샷
+  result_manager.py      결과 반영(apply) — 사람이 수정한 파일은 덮어쓰지 않음
+  research_*.py          TRIAD 연구 모드(독립 연구 → 상호 비판 → 종합 → 실험 → 해석)
+  usage.py               역할별 토큰/호출 집계
+  solomon_bridge.py      외부 "CEO" 서비스가 미션을 보내는 /bridge 연동
+  chat_manager.py        채팅 세션/메시지/provenance 저장
+  db_path.py             SQLite 경로 단일화 (data/director.db)
+
+schemas/                 pydantic 모델: OrderSchema, BuilderResultSchema, ReviewResultSchema, DecisionSchema, Provenance, Research
+console/                 index.html + trinity.js/stage.js(무대형 대시보드) + console.js
+scripts/                 cli_diagnostics.py(CLI 진단), test_role_cli_smoke.py, retry_transport_run.py, pick_folder.py
+tests/                   ~625개 테스트 (스텁 CLI, DIRECTOR_TESTING=1). 실제 CLI 통합은 -m integration_cli 로 opt-in
+docs/                    설계·마일스톤 문서
+```
+
+### 처음 읽을 때 추천 순서
+
+1. `config.yaml` — 전체 동작을 좌우하는 설정
+2. `director.py` — 진입점, 각 명령이 무엇을 호출하는지
+3. `core/orchestrator.py` — `_init_head/_init_builder/_init_reviewer`(L52~104), `run()`(L1291~)
+4. `core/env_utils.py` + `core/research_runner.py::_command` — CLI 호출 방식의 핵심
+5. `agents/claude_head.py`, `agents/proposal_builder.py` — 실제 프롬프트와 응답 파싱
+6. `core/mission.py` — 다단계 미션 흐름
+7. `companion_server.py` → `dashboard_server.py` — UI/API 계층
+
+---
+
+## 3. 실행 방법
+
+### 3.1 설치 / 테스트
+
+```bash
+pip install -r requirements.txt
+python -m pytest -q                       # CLI 없이 스텁으로 동작 (README 기준 약 25~35분)
+python -m pytest -m integration_cli       # 실제 로그인된 CLI로 도는 통합 테스트 (opt-in)
+```
+
+사전 조건: Git, 그리고 **구독 로그인된** `claude`(`--tools` 옵션 지원 버전), `codex`.
+`agy`는 기본 비활성(아래 5.4 참고).
+
+### 3.2 CLI로 직접 실행 (`director.py`)
+
+```bash
+# 단일 run: ORDER 1개를 만들고 BUILD→VERIFY→REVIEW→DECIDE
+python director.py run -p /path/to/project -g "src/calc.py에 add(a,b) 추가하고 테스트 작성"
+python director.py run -p ... -g ... --head-provider codex     # HEAD 공급자만 일시 변경 (claude|codex|mock)
+
+# 미션: HEAD가 마일스톤을 계획하며 여러 run을 이어서 실행
+python director.py mission -p /path/to/project -g "회원가입 흐름을 끝까지 구현" [--profile quick|standard|deep] [--max-steps N]
+python director.py mission -p ... -g ... --mission-id <ID> [--replan "이유"]   # 기존 미션 이어가기
+
+# do: 미션 + 자동 반영을 한 번에 (기본 프로젝트 = 현재 폴더가 git repo면 거기)
+python director.py do "로그인 버그 고쳐" --profile quick [--no-apply]
+
+python director.py status [-r RUN_ID]
+python director.py resume RUN_ID
+python director.py clean-worktrees -p /path/to/project --dry-run [--purge-reviewed]
+```
+
+### 3.3 콘솔(웹 UI) 실행
+
+```bash
+# macOS / Linux (코드상 지원, README상 "미검증")
+chmod +x start-companion.sh stop-companion.sh
+./start-companion.sh      # python3 companion_server.py를 nohup 백그라운드로, PID → data/companion.pid
+./stop-companion.sh
+
+# Windows
+.\start-companion.ps1 / .\stop-companion.ps1
+```
+
+- 시작 시 `http://127.0.0.1:8081/?token=...` 형태의 **연결 주소**가 출력됩니다. 브라우저당 최초 1회 이 주소로 접속하면 세션이 생깁니다.
+- 토큰 파일: `data/solomon-bridge.token` (최초 실행 시 생성). 로그: `data/companion.log`, `data/companion.err`.
+- `/` = TRINITY 무대형 대시보드, `/classic` = 표 중심 작업실 화면.
+- 서버는 항상 `127.0.0.1`에만 바인딩. 상태 변경 요청(POST)은 로컬 출처 검사 + 세션 또는 브리지 토큰 필요.
+
+### 3.4 생성되는 런타임 데이터
+
+| 위치 | 내용 |
+|---|---|
+| `data/director.db` | run 상태/전이/감사 로그, 채팅, 공급자 health (SQLite) |
+| `data/role_settings.json` | 콘솔에서 바꾼 역할 배치 (있으면 config.yaml 역할을 덮어씀) |
+| `data/` 하위 run/mission JSON | ORDER, builder 결과, 검증, 리뷰, 결정, provenance |
+| `<대상 프로젝트>/.director_worktrees/` | 각 run의 격리 git worktree (원본 프로젝트는 직접 수정하지 않음) |
+
+---
+
+## 4. 전체 동작 흐름
+
+### 4.1 단일 run (NORMAL 파이프라인) — `core/orchestrator.py::Orchestrator.run`
+
+```
+goal
+ │
+ ▼ HEAD.create_order()            → OrderSchema (allowed_paths, protected_paths, 상한, acceptance_criteria …)
+ │   Scope Guard 상한 적용 (apply_safety_caps)
+ ▼ git worktree 생성 (.director_worktrees/…) + 베이스라인 테스트
+ ▼ BUILDER.run(order, worktree)   → (proposal 모드) CLI가 JSON으로 파일 전체/편집 제안 → Director가 검증 후 기록
+ │   validate_post_build: 경로·파일 수·diff·삭제·제어면 파일 검사
+ ▼ Verifier: build/test/lint 명령 (config.yaml 또는 projects.<root>.verification)
+ ▼ REVIEWER.review()              → ReviewResultSchema (응답 없음/깨짐 = FAIL, fail-closed)
+ ▼ HEAD.decide()                  → PASS / FAIL(수정 지시 next_steps) / HUMAN_REQUIRED
+ │   FAIL이면 max_repairs 만큼 BUILDER 재시도 (마지막 시도는 다른 공급자로 교체)
+ ▼ apply_final_pass_gate → 최종 상태 기록
+```
+
+각 단계 실패 시 `ProviderManager`가 에러를 분류(사용량 한도/인증/설정 오류 등)하고, 자율 모드에서는
+`_swap_agent`로 다른 공급자에게 역할을 넘깁니다(`_run_builder_autonomous`, `_run_reviewer_autonomous`, `_run_decision_autonomous`).
+
+### 4.2 미션 — `core/mission.py::MissionRunner`
+
+- 채팅 메시지(또는 `director.py mission/do`)가 미션이 됨. HEAD `chat()`이 QUESTION/DEV_TASK를 판별하고 첫 ORDER를 만듦.
+- `_advance` → `_plan`(HEAD `plan_next`) → `_execute`(Orchestrator.run, 직전 PASS worktree 스냅샷을 `base_worktree`로) 반복.
+- `max_steps`, `max_consecutive_failures`로 제한. 완료 시 `auto_apply`(off / on_done / on_pass)에 따라 프로젝트에 반영.
+- "중단/멈춰/stop" 또는 콘솔 정지 버튼 → 실행 중 CLI 프로세스 트리 종료, 미션 STOPPED 고정.
+
+### 4.3 TRIAD 연구 모드 — `core/research_orchestrator.py`
+
+세 공급자가 독립 연구 → 상호 비판 → 종합 가설 → NORMAL 파이프라인으로 실험 → 세 갈래 해석.
+**3개 공급자가 모두 필요**하므로 Antigravity를 켜야 동작합니다. 상세: `docs/V3_TRIAD_RESEARCH_PLAN.md`.
+
+---
+
+## 5. Claude / Codex / Antigravity CLI 연결 상세
+
+### 5.1 공통 구조
+
+```
+config.yaml (head/builder/reviewer.provider)
+   + data/role_settings.json (콘솔 역할 교환, core/role_settings.py::apply)
+        │
+        ▼
+Orchestrator._init_head / _init_builder / _init_reviewer   (core/orchestrator.py:52~104)
+        │  provider 문자열로 어댑터 클래스 선택
+        ▼
+agents/*.py 어댑터  ──►  core/env_utils.resolve_cli(name)       실행 파일 경로 탐색
+                    ──►  core/env_utils.get_sanitized_env()     과금 관련 환경 변수 제거
+                    ──►  core/process_runner.ProcessTreeRunner.run(argv, stdin_data=prompt, ...)
+                              (shell=False, 전체 타임아웃 + 무출력 타임아웃, 타임아웃 시 프로세스 트리 kill)
+                    ◄──  stdout 파싱 → JSON 추출(_extract_json) → pydantic 스키마 검증
+```
+
+핵심 포인트:
+
+- **API/SDK 호출은 전혀 없습니다.** 모두 공식 CLI를 서브프로세스로 실행합니다.
+- **프롬프트는 stdin으로 전달**합니다(Windows 명령줄 길이 제한 회피). 모델 지정 플래그는 넘기지 않으며 각 CLI 계정의 기본 모델을 씁니다.
+- 공급자 이름 별칭 (`core/role_settings.py`):
+
+  | 별칭 | 내부 키 | 도메인(ProviderManager) | 실행 파일 |
+  |---|---|---|---|
+  | `claude`, `anthropic` | claude | ANTHROPIC | `claude` |
+  | `codex`, `openai` | openai | OPENAI | `codex` |
+  | `antigravity`, `google` | antigravity | GOOGLE | `agy` |
+
+- 기본 역할 배치(`config.yaml`): **HEAD = Claude, BUILDER = Codex(proposal 모드), REVIEWER = Claude**.
+  콘솔 역할 교환은 세 역할에 **서로 다른 AI**를 지정해야 합니다(`role_settings.validate`).
+
+### 5.2 실행 파일 탐색 — `core/env_utils.py::resolve_cli`
+
+1. (Windows) `%LOCALAPPDATA%/OpenAI/Codex/bin/*/codex.exe`, `%APPDATA%/Claude/claude-code/*/claude.exe` 중 최신
+2. `shutil.which(name)` — PATH
+3. 알려진 설치 위치: `~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, `~/.claude/local/claude`, `%APPDATA%/npm/*.cmd`, `~/.agy/bin/agy` 등
+4. `agy`는 `antigravity.enabled: false`면 **항상 None** (탐색조차 안 함)
+
+명시적 경로 지정: `config.yaml`의 `head/builder/reviewer.executable`, 또는 환경 변수 `CLAUDE_BIN`, `CODEX_BIN`, `ANTIGRAVITY_BIN`(리뷰어/빌더 어댑터에서 사용).
+
+### 5.3 실제 호출 커맨드 (역할별)
+
+| CLI | 역할 | 위치 | 커맨드 | 비고 |
+|---|---|---|---|---|
+| **Claude Code** | HEAD | `agents/claude_head.py::_invoke_cli` | `claude --print --output-format json --tools Read,Glob,Grep --permission-mode default --strict-mcp-config --mcp-config '{"mcpServers":{}}'` | stdout JSON envelope의 `result` 필드 사용. cwd = 프로젝트/worktree |
+| Claude Code | REVIEWER | `agents/claude_reviewer.py::_review_with_cli` | `claude --print <읽기 전용 플래그>` | |
+| Claude Code | BUILDER / TRIAD | `core/research_runner.py::_command("ANTHROPIC")` | `claude --print --output-format json <읽기 전용 플래그>` | Builder 응답이 `{"type":"result"}` envelope면 한 번 더 풀어서 파싱 |
+| **Codex** | HEAD | `agents/codex_head.py::_invoke_cli` | `codex exec --sandbox read-only -` | `-` = stdin에서 프롬프트 읽기. cwd = `git rev-parse --show-toplevel` 결과 |
+| Codex | REVIEWER | `agents/codex_reviewer.py::_review_with_cli` | `codex exec --sandbox read-only -` | |
+| Codex | BUILDER / TRIAD | `research_runner._command("OPENAI")` | `codex exec --sandbox read-only -` | |
+| **Antigravity** | HEAD / REVIEWER | `agents/google_roles.py` → `TriadResearchRunner` | `agy --input-format stream-json --output-format stream-json --sandbox` | stdin에 NDJSON `{"event":"user","message":{...}}`. 빈 임시 폴더에서 "도구 쓰지 말 것" 지시로 실행 |
+| Antigravity | BUILDER (proposal) | `proposal_builder.py` → `TriadResearchRunner` | 위와 동일 | |
+| Antigravity | BUILDER (직접 편집, 레거시) | `agents/antigravity_builder.py::_execute_agy` | `agy --input-format stream-json --output-format stream-json --mode accept-edits --sandbox` | **worktree에서 직접 파일 편집**. 실행 전 범위 제한 권한 설정을 worktree에 설치하고 끝나면 복원. `result` 이벤트로 종료 판단, 출력 토큰 한도 시 1회 이어서 재시도 |
+
+공통 읽기 전용 플래그(`env_utils.CLAUDE_READ_ONLY_FLAGS`)는 사용자의 개인 Claude 설정(허용 도구, MCP 서버)이 상속되지 않도록 막는 장치입니다.
+Codex는 모든 역할에서 `--sandbox read-only`로만 실행됩니다.
+
+### 5.4 BUILDER의 "proposal 모드" — 왜 CLI가 파일을 직접 안 쓰나
+
+`config.yaml`의 `builder.mode: proposal`(기본, 역할 교환 시 강제)에서는:
+
+1. `ProposalBuilder.run`이 worktree를 훑어 **편집 가능 파일**(Scope Guard 통과)과 **참고용 소스**를 골라 프롬프트에 직접 넣음
+   (예산: 편집 가능 140KB, 참고 60KB, 비밀/토큰 관련 파일·100KB 이상 파일 제외).
+2. CLI는 **빈 임시 디렉터리**(`director-builder-*`)에서 실행되고, `{"files":[...], "edits":[...], "summary":...}` JSON만 반환.
+3. Director가 JSON을 파싱(깨진 이스케이프 자동 수리) → `resolve_changes`로 경로·앵커 검증 → 배치 전체가 유효할 때만 worktree에 기록.
+
+즉 어떤 CLI가 Builder여도 **파일 쓰기 권한은 Director만** 갖습니다. (레거시 `AntigravityBuilder` 직접 편집 모드만 예외)
+
+### 5.5 Antigravity 활성화 조건
+
+- `config.yaml`의 `antigravity.enabled: false`가 기본. 구글 Antigravity FAQ상 소비자 플랜에서 다른 앱으로 감싸 쓰는 것은
+  미지원이며 계정 정지 위험이 있다는 이유(README, config 주석).
+- 꺼져 있으면: `resolve_cli('agy')` → None, `ProviderManager.check_health`에서 GOOGLE = UNAVAILABLE,
+  "정상 모드" 기준이 3개가 아닌 **2개 공급자**로 바뀜(`_mode_for_usable`). TRIAD 연구 모드는 사용 불가.
+- 테스트(`DIRECTOR_TESTING=1`)에서는 항상 켜진 것으로 간주.
+
+### 5.6 과금(API 키) 차단 — `get_sanitized_env`
+
+모든 CLI 호출과 검증 명령의 환경에서 다음을 제거:
+- 이름이 `*_API_KEY(S)`로 끝나는 모든 변수
+- `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK/VERTEX/FOUNDRY`, `OPENAI_BASE_URL`, `OPENAI_ORG_ID`,
+  `GOOGLE_GENAI_USE_VERTEXAI` 등 엔드포인트·클라우드 과금 전환 변수
+
+한계: CLI 자체를 API 키로 로그인했다면(예: `codex login --with-api-key`) 막을 수 없습니다. provenance의
+`api_key_used: false`는 "환경 변수를 지우고 호출했다"는 선언값이지 측정값이 아닙니다.
+
+### 5.7 장애 조치 — `core/provider_manager.py`
+
+- 상태: HEALTHY / RECOVERING / DOWN / UNAVAILABLE 등, SQLite `provider_health`에 저장.
+- `check_health`는 `--version` 프로브만 수행(추론 호출 아님). 프로브 성공은 RECOVERING까지만, HEALTHY는 실제 호출 성공(`record_success`) 후.
+- 출력 텍스트로 에러 분류(`ErrorCategory.classify`): 사용량 한도, 인증, 설정 오류(신뢰 디렉터리 등)는 다르게 처리 — 설정/실행 오류는 공급자를 DOWN으로 만들지 않음.
+- 모드: 사용 가능 공급자 수에 따라 NORMAL / DEGRADED / STOP. 자율 모드에서 실패한 역할은 다른 공급자로 교체.
+
+---
+
+## 6. 안전 장치 요약
+
+| 장치 | 위치 |
+|---|---|
+| 원본 무수정 (worktree에서만 빌드) | `core/git_manager.py`, `orchestrator.run` |
+| Scope Guard (경로/파일 수/diff 상한, 보호 경로) | `core/safety.py`, `orchestrator.validate_post_build` |
+| 프로젝트별 검증 명령은 Director 설정에만 (빌더가 약화 불가) | `config.yaml: projects` |
+| 리뷰어 fail-closed | `claude_reviewer.py`, `codex_reviewer.py` |
+| 사람 확인 필요 조건 (결제/실계좌/자격증명/비가역) | `core/autopilot.py`, `BaseHead.PROXY_POLICY` |
+| 프로세스 트리 타임아웃 | `core/process_runner.py` (psutil / Windows `taskkill /T`) |
+| 콘솔 인증 (로컬 출처 + 세션/토큰) | `companion_server.py::authorized` |
+
+**주의 (README 명시):** AI가 쓴 테스트/빌드 명령은 **샌드박스 없이 현재 OS 계정 권한으로 실행**됩니다.
+worktree는 파일 변경 격리일 뿐 보안 격리가 아니므로 VM/별도 계정에서 사용을 권장합니다.
+
+---
+
+## 7. 대시보드 프런트엔드 구조
+
+빌드 도구·외부 라이브러리·CDN 없이 **순수 HTML/CSS/JS**입니다. 화면은 두 종류입니다.
+
+### 7.1 TRINITY 콘솔 (`/`) — `console/` 폴더의 정적 파일
+
+| 파일 | 줄 수 | 역할 |
+|---|---|---|
+| `console/index.html` | 101 | 뼈대 페이지. `stage.css`, `trinity.js`, `stage.js`, `console.js`를 불러오고, 작업실 화면을 담는 `<iframe id="workspace">`를 가짐 |
+| `console/stage.css` | 278 | 무대 화면 스타일 |
+| `console/trinity.js` | 330 | **WebGL2 3D 무대**. 역할별 슬롯 0=HEAD(위), 1=BUILDER(왼쪽), 2=REVIEWER(오른쪽) 세 코어가 하나의 코어로 합쳐지는 장면. 속도·밝기·색은 실제 작업 기록(`/ops/activity`)에 따라 `Trinity.set()`으로 바뀜 |
+| `console/stage.js` | 400 | 무대 위 정보 패널(HUD). `/ops/activity`, `/status`, `/chat/messages`, `/ops/replay`를 읽어 하나의 모델을 만들고, 그 모델로 패널과 3D 장면을 함께 갱신. 실시간 보기와 다시보기가 같은 모델을 씀. 채팅 전송(`/chat`), 역할 변경(`/ops/roles`), 미션 결정(`/ops/mission/decide`) |
+| `console/console.js` | 199 | iframe 안의 작업실 화면에 **미션 컨트롤 패널**을 끼워 넣음. 작업 정지(`/ops/missions/stop`), 시스템 중지(`/ops/shutdown`), 폴더 선택(`/ops/pick-folder`), 역할 변경, 상태 조회(`/ops/state`, `/status`, `/project`) |
+| `console/console.css` | 60 | `console.js`가 iframe 문서에 넣는 패널 스타일 |
+
+- 이 파일들은 `companion_server.py`의 `STATIC_FILES` **허용 목록**에 있는 것만 제공됩니다. `console/` 밖의 파일은 서버가 내보내지 않습니다.
+- 응답 헤더에 CSP(`default-src 'self'`)가 붙어 외부 스크립트나 리소스를 불러올 수 없습니다.
+- `console.js`에는 원작자의 외부 서비스인 "솔로몬 집무실"(`http://127.0.0.1:8710`) 링크가 하드코딩되어 있습니다. 이 환경에서는 동작하지 않습니다.
+
+### 7.2 작업실 화면 (`/classic`, 콘솔 안 iframe) — Python이 HTML을 직접 생성
+
+`/classic`은 **파일이나 폴더가 아니라 URL 경로**입니다. 요청 처리 흐름은 다음과 같습니다.
+
+```
+브라우저 GET /classic
+  → companion_server.py:160   if path == '/classic': self.path = '/'   (경로를 '/'로 바꿔 넘김)
+  → dashboard_server.py:2980  if parsed.path == '/': body = render_html()
+  → dashboard_server.py:2486  render_html()  ← HTML/CSS/JS 전체를 Python 문자열로 만들어 응답
+```
+
+- `dashboard_i18n.py`는 상태, 결과, 실패 이유 코드 같은 화면 문구를 한국어로 바꾸고 권장 조치 문구를 제공합니다.
+- 작업실 화면을 고치려면 `dashboard_server.py`의 `render_html()`을 수정합니다.
+
+### 7.3 화면별 수정 위치 정리
+
+| 고치고 싶은 것 | 파일 |
+|---|---|
+| 3D 무대 연출 | `console/trinity.js` |
+| 무대 위 패널, 채팅 UI | `console/stage.js`, `console/stage.css` |
+| 작업실 상단 미션 컨트롤 패널 | `console/console.js`, `console/console.css` |
+| 표 중심 작업실 화면 | `dashboard_server.py::render_html()` |
+| 한국어 문구 | `dashboard_i18n.py` |
+| 정적 파일 추가 | `console/`에 파일을 넣고 `companion_server.py`의 `STATIC_FILES`에 등록 |
+
+---
+
+## 8. 콘솔 서버 API 개요 (`companion_server.py`)
+
+| 메서드 | 경로 | 용도 |
+|---|---|---|
+| GET | `/?token=...` | 최초 브라우저 연결(세션 발급) |
+| GET | `/`, `/classic` | TRINITY 무대 / 작업실 화면 |
+| GET/POST | `/ops/roles` | 역할 배치 조회/변경 → `data/role_settings.json` |
+| GET | `/ops/state` | 전체 상태 |
+| POST | `/ops/missions/stop` | 미션 정지 |
+| POST | `/ops/shutdown` | 시스템 중지 |
+| POST | `/ops/pick-folder` | 폴더 선택 창(tkinter) |
+| GET/POST | `/bridge/status, /bridge/projects, /bridge/digest, /bridge/missions, /bridge/orders …` | 외부 Solomon(CEO) 서비스 연동, 브리지 토큰 필요 |
+
+그 외 요청(`/status`, `/chat`, `/chat/messages`, `/project`, `/ops/activity`, `/ops/replay` 등)은 `companion_server.py`의
+`CompanionHandler`가 상속한 `dashboard_server.py` 핸들러가 처리합니다(`handle_chat_message`, `_run_mission_thread`,
+`MissionRunner` 등). `/ops/state` 응답에는 진단 결과(`data/cli_diagnostics.json`)도 포함됩니다.
+
+---
+
+## 9. CLI 진단 스크립트와 연습용 폴더
+
+| 폴더 | 역할 | 쌓이는 것 |
+|---|---|---|
+| `~/projects/director_smoke` | `scripts/cli_diagnostics.py`가 CLI를 실행하는 **빈 git 저장소**. 기본값은 Director 폴더 옆이고 `DIRECTOR_SMOKE_PROJECT`로 바꿀 수 있음 | 없음. HEAD 역할(읽기 전용)만 시험하고 결과는 `data/cli_diagnostics.json`에 저장 |
+| 작업 대상 프로젝트 (예: `~/projects/director_sandbox`) | `director.py run/mission/do`나 콘솔에서 고른 실제 작업 대상 | `.director_worktrees/RUN-…/` 아래 실행별 결과 코드 |
+
+- 진단은 Codex와 Claude에게 실제로 `create_order`를 시켜서 `HEAD_VERIFIED` 또는 `FAILED`를 판정합니다. 화면에는 상태만 출력되고 **오류 원인은 JSON의 `summary`**에 있습니다.
+- 빈 전용 저장소를 쓰는 이유: Codex 어댑터는 작업 위치가 git 저장소여야 하고, 실제 프로젝트 코드가 프롬프트에 섞이지 않아야 결과가 일정하기 때문입니다.
+- 원래 코드는 smoke 폴더가 이미 있다고 가정해서, 폴더가 없으면 두 공급자 모두 FAILED가 났습니다. Codex 쪽 메시지는 "git executable not found"로 잘못 표시됐습니다. 지금은 진단 시작 시 `core/bootstrap.prepare_project()`로 폴더 생성, `git init`, 빈 시작 커밋을 자동으로 처리합니다.
+
+### 자주 만나는 실패
+
+| 증상 (`summary`) | 원인 | 조치 |
+|---|---|---|
+| `Not logged in · Please run /login` (Claude) | `ANTHROPIC_API_KEY` 환경 변수로만 인증된 상태. Director가 이 변수를 지우고 실행하므로 인증 정보가 없음 | `claude` 실행 후 `/login`으로 구독 계정 로그인 |
+| `CONFIG_ERROR: ... not inside a git repository` (Codex) | 작업 위치가 git 저장소가 아님 | 대상 폴더에서 `git init` (run/mission은 자동 처리) |
+| `CONFIG_ERROR: ... CLI not found` | 실행 파일을 찾지 못함 | PATH 확인, 또는 `config.yaml`의 `executable`에 경로 지정 |
+
+---
+
+## 10. macOS 환경 관련 메모
+
+- README상 macOS/Linux는 **코드만 대응, 실기 미검증**(v3.1.8~).
+- `config.yaml`의 `solomon.allowed_roots`가 `D:/work` 등 Windows 경로로 되어 있으므로, Solomon 브리지를 쓸 경우 맥 경로로 수정 필요.
+- 폴더 선택 창은 tkinter 필요 (Homebrew Python이면 `brew install python-tk`). 없으면 콘솔에 경로 직접 입력.
+- CLI 진단: `python scripts/cli_diagnostics.py`, 역할별 smoke: `python scripts/test_role_cli_smoke.py`.
+- 시스템 파이썬(`/usr/bin/python3`)에는 `python` 명령이 없습니다. `python3 -m venv .venv && source .venv/bin/activate`로
+  가상환경을 켜면 `python`이 생기고, 기본 검증 명령(`python -m pytest tests/`)도 동작합니다.
+- 전체 흐름 다이어그램은 `docs/FLOW_DIAGRAM.md`를 참고하세요.
