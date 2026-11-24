@@ -345,7 +345,7 @@ worktree는 파일 변경 격리일 뿐 보안 격리가 아니므로 VM/별도 
 | GET | `/ops/state` | 전체 상태 |
 | POST | `/ops/missions/stop` | 미션 정지 |
 | POST | `/ops/shutdown` | 시스템 중지 |
-| POST | `/ops/pick-folder` | 폴더 선택 창(tkinter) |
+| POST | `/ops/pick-folder` | 폴더 선택 창(`scripts/pick_folder.py` 실행: macOS는 osascript, Windows/Linux는 tkinter) |
 | GET/POST | `/bridge/status, /bridge/projects, /bridge/digest, /bridge/missions, /bridge/orders …` | 외부 Solomon(CEO) 서비스 연동, 브리지 토큰 필요 |
 
 그 외 요청(`/status`, `/chat`, `/chat/messages`, `/project`, `/ops/activity`, `/ops/replay` 등)은 `companion_server.py`의
@@ -379,7 +379,10 @@ worktree는 파일 변경 격리일 뿐 보안 격리가 아니므로 VM/별도 
 
 - README상 macOS/Linux는 **코드만 대응, 실기 미검증**(v3.1.8~).
 - `config.yaml`의 `solomon.allowed_roots`가 `D:/work` 등 Windows 경로로 되어 있으므로, Solomon 브리지를 쓸 경우 맥 경로로 수정 필요.
-- 폴더 선택 창은 tkinter 필요 (Homebrew Python이면 `brew install python-tk`). 없으면 콘솔에 경로 직접 입력.
+- 폴더 선택 창은 macOS에서 AppleScript(`osascript` → `choose folder`)를 씁니다. CommandLineTools 기본 Python 3.9에 딸린
+  Tk 8.5는 macOS 26에서 `macOS 26 (2601) or later required, have instead 16 (1601)`로 강제 종료되기 때문입니다.
+  창이 뜨기까지 몇 초 걸릴 수 있고, 브라우저 뒤에 열릴 수 있습니다. 안 되면 콘솔에 절대 경로를 직접 입력합니다.
+  Windows/Linux는 기존대로 tkinter를 씁니다.
 - CLI 진단: `python scripts/cli_diagnostics.py`, 역할별 smoke: `python scripts/test_role_cli_smoke.py`.
 - 시스템 파이썬(`/usr/bin/python3`)에는 `python` 명령이 없습니다. `python3 -m venv .venv && source .venv/bin/activate`로
   가상환경을 켜면 `python`이 생기고, 기본 검증 명령(`python -m pytest tests/`)도 동작합니다.
@@ -456,7 +459,8 @@ source .venv/bin/activate      # 서버를 켜기 전에 가상환경부터 켜�
 
 **3. 프로젝트 폴더 선택**
 
-- 콘솔의 폴더 선택 버튼(tkinter 창, `/ops/pick-folder`)을 쓰거나 경로를 직접 입력합니다(`POST /project` → `set_project`).
+- 콘솔의 폴더 선택 버튼(macOS는 osascript 창, Windows/Linux는 tkinter 창, `/ops/pick-folder`)을 쓰거나
+  경로를 직접 입력합니다(`POST /project` → `set_project`). 직접 입력할 때는 `~` 없이 절대 경로로 적습니다.
 - 선택하지 않아도 HEAD는 답하지만, 개발 작업이면 `PROJECT_SELECTION_REQUIRED`(HUMAN_REQUIRED)로 멈춥니다.
 
 **4. 지시 문장**
