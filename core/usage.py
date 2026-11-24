@@ -33,9 +33,24 @@ def context() -> Dict[str, Any]:
     return dict(_CTX.get() or {})
 
 
+_VERSION_NAME = re.compile(r"^\d+(\.\d+)*$")
+
+
 def provider_of(argv0: str) -> Optional[str]:
-    base = os.path.basename(str(argv0 or "")).lower()
-    return PROVIDER_BY_CLI.get(base.split(".")[0])
+    path = str(argv0 or "").replace("\\", "/")
+    base = os.path.basename(path).lower()
+    found = PROVIDER_BY_CLI.get(base.split(".")[0])
+    if found or not _VERSION_NAME.match(base):
+        return found
+    # resolve_cli() follows symlinks, and Claude Code's native installer links ~/.local/bin/claude to
+    # ~/.local/share/claude/versions/<version>: the executable is then named "2.1.331" and every Claude call went
+    # unrecorded. For a version-named executable only, take the tool name from the nearest folder above it
+    # (skipping "versions"); other executables (python, git, ...) are never matched by folder names.
+    for part in reversed(path.lower().split("/")[:-1]):
+        if part in ("versions", "version", "bin", ""):
+            continue
+        return PROVIDER_BY_CLI.get(part)
+    return None
 
 
 def estimate_tokens(text: Optional[str]) -> int:

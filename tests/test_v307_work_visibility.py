@@ -53,6 +53,18 @@ def test_only_ai_clis_are_recorded():
     assert usage.call_started([r"C:\stub\director-stub-cli.cmd"], "") is None
 
 
+def test_symlink_resolved_claude_install_is_still_recognised():
+    """Claude Code's native installer: ~/.local/bin/claude -> ~/.local/share/claude/versions/<version>. resolve_cli()
+    follows the link, so the executable is named like a version; it must still count as Claude. Folder names never
+    turn an ordinary executable into an AI CLI."""
+    assert usage.provider_of("/Users/u/.local/share/claude/versions/2.1.331") == "ANTHROPIC"
+    assert usage.provider_of("/opt/x/agy/versions/1.0") == "GOOGLE"
+    assert usage.provider_of("/opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js") == "OPENAI"
+    assert usage.provider_of(r"C:\Tools\claude.exe") == "ANTHROPIC"
+    assert usage.provider_of("/Users/u/projects/claude/.venv/bin/python") is None
+    assert usage.provider_of("/x/other/versions/3.2") is None
+
+
 def test_aggregate_per_role_and_provider_and_running_now():
     usage.set_context(role="BUILDER", stage="BUILDING", run_id="RUN-B", mission_id="MSN-B")
     done = usage.call_started(["agy.exe"], "p")
