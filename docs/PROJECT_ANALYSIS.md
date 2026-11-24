@@ -425,3 +425,74 @@ worktree는 파일 변경 격리일 뿐 보안 격리가 아니므로 VM/별도 
 즉 **"기억을 공유하지 않는 별개의 실행"이지만 "다른 두뇌"는 아닙니다.** 기본 구성(HEAD·REVIEWER = Claude, BUILDER = Codex)은
 적어도 만드는 쪽과 검토하는 쪽을 다른 AI로 나눈 것입니다. 세 역할을 모두 다른 AI로 나누려면 Antigravity를 켜야 하고,
 콘솔의 역할 교환 기능(`core/role_settings.py`)은 처음부터 세 역할에 서로 다른 AI를 지정하도록 강제합니다.
+
+---
+
+## 12. 대시보드에서 HEAD에게 새 작업 지시하기
+
+콘솔 채팅창("HEAD에게 지시하기")에 입력한 메시지는 `POST /chat` → `submit_chat` → `dashboard_server.py::handle_chat_message`로
+처리됩니다. 아래 조건이 갖춰져야 미션이 시작됩니다.
+
+### 12.1 필요한 것
+
+**1. 콘솔 서버 실행과 브라우저 연결**
+
+```bash
+cd ~/projects/ai-dev-director
+source .venv/bin/activate      # 서버를 켜기 전에 가상환경부터 켜기
+./start-companion.sh           # 출력된 http://127.0.0.1:8081/?token=... 로 처음 한 번 접속
+```
+
+- 토큰 주소로 접속해 세션 쿠키를 받은 브라우저만 채팅 같은 상태 변경 요청을 보낼 수 있습니다(`companion_server.py::authorized`).
+- 가상환경을 먼저 켜야 하는 이유: 검증 명령 `python -m pytest tests/`가 서버 프로세스의 PATH를 그대로 씁니다.
+  macOS 시스템 파이썬에는 `python` 명령이 없어서, 가상환경 없이 서버를 띄우면 검증 단계가 실패할 수 있습니다.
+  대상 프로젝트 안에 `.venv`가 있으면 그 파이썬을 우선 사용합니다(`core/bootstrap.py::configure_runtime`).
+
+**2. HEAD 역할의 CLI가 실제로 응답할 것**
+
+- 채팅 메시지는 HEAD에게 바로 전달됩니다(`orch.head.chat`). HEAD CLI가 로그인돼 있지 않으면 `HEAD Error: ... Not logged in`이 납니다.
+- HEAD가 Claude라면 `claude` → `/login`으로 구독 로그인이 필요합니다. 아니면 역할 버튼이나 `config.yaml`에서 HEAD를 다른 공급자로 바꿉니다.
+- 호출 전 `--version` 확인 결과 쓸 수 있는 공급자가 부족하면 `SYSTEM STOP: insufficient healthy providers`로 멈춥니다.
+
+**3. 프로젝트 폴더 선택**
+
+- 콘솔의 폴더 선택 버튼(tkinter 창, `/ops/pick-folder`)을 쓰거나 경로를 직접 입력합니다(`POST /project` → `set_project`).
+- 선택하지 않아도 HEAD는 답하지만, 개발 작업이면 `PROJECT_SELECTION_REQUIRED`(HUMAN_REQUIRED)로 멈춥니다.
+
+**4. 지시 문장**
+
+- 예: `캡션 글자 수 검사기를 만들어줘`
+- HEAD가 **QUESTION(질문)인지 DEV_TASK(개발 작업)인지** 판단합니다. 질문이면 답만 하고, 개발 작업이면 첫 ORDER를 만듭니다.
+- 그다음 경로 표기 자동 보정(`core/entry_repair.py`), 사전 검사(`autopilot.entry_gate`)를 거쳐 **미션**으로 시작합니다.
+
+### 12.2 선택 사항
+
+| 항목 | 방법 |
+|---|---|
+| 작업 규모(프로필) | 메시지 앞에 `[빠르게]`/`[quick]`, `[표준]`, `[깊게]`/`[deep]` 붙이기. 최대 단계 2 / 6 / 12 (`autopilot.PROFILE_TAGS`) |
+| 정지 | 80자 이하의 짧은 정지 메시지(`멈춰`, `중단`, `stop` 등) 또는 작업 정지 버튼. HEAD에게 보내지 않고 바로 정지 처리됨 |
+| 결과 반영 | 기본값 `autonomy.auto_apply: "off"`. 결과를 확인한 뒤 **반영** 버튼을 눌러야 원본에 적용 |
+
+### 12.3 실행이 멈추는 경우
+
+- 결제·유료 서비스, 실제 자격증명, 실계좌 주문, 되돌릴 수 없는 외부 행동이 포함되면 → `HUMAN_REQUIRED` (사람 승인 필요)
+- 같은 프로젝트에 이미 실행 중인 작업이 있으면 → 바쁨 메시지
+- 채팅은 한 번에 하나만 처리합니다. 앞 요청을 처리하는 중에는 `409 busy`를 돌려줍니다.
+- 같은 `request_id`로 다시 보내면 HEAD를 또 부르지 않습니다(`duplicate`).
+
+### 12.4 작업 대상 폴더 조건
+
+꼭 **새** 경로일 필요는 없습니다. 필요한 것은 작업 대상이 될 프로젝트 폴더 하나입니다
+(`set_project` → `bootstrap.prepare_project` → `validate_project_path`).
+
+| 경우 | 가능 여부 | 비고 |
+|---|---|---|
+| 이미 있는 git 프로젝트 | ✅ | 가장 일반적인 경우. 원본은 그대로 두고 그 안의 `.director_worktrees/`에서 작업 |
+| 이미 있지만 git이 아닌 폴더 | ✅ | 자동으로 `git init`과 빈 시작 커밋을 만듦. 그 폴더에 `.git`이 새로 생김 |
+| 새 빈 폴더 (없는 경로 포함) | ✅ | 폴더 생성부터 자동. 새 프로젝트를 처음부터 만들 때 사용 |
+| `ai-dev-director` 폴더 자체나 그 하위 | ❌ | Director 자기 자신은 대상으로 쓸 수 없음 |
+| 홈 폴더(`~`), 루트(`/`), Director의 상위 폴더 | ❌ | 범위가 너무 넓은 경로라 막혀 있음 |
+
+- 어떤 폴더를 고르든 결과는 `<폴더>/.director_worktrees/RUN-…`에 생기고, 반영 전까지 원본 파일은 바뀌지 않습니다.
+- 실제로 쓰던 프로젝트를 고르면 HEAD와 BUILDER가 그 코드를 읽고, AI가 만든 테스트가 그 위에서 **현재 OS 계정 권한으로** 실행됩니다.
+  처음에는 연습용 폴더(예: `~/projects/director_sandbox`)로 익숙해진 뒤 실제 프로젝트에 쓰는 것을 권장합니다.
