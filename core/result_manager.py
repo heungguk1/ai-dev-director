@@ -588,15 +588,25 @@ class ResultManager:
         run = self.sm.get_run(run_id) or {}
         wt, proj = run.get("worktree_path") or "", run.get("project_path") or ""
         wt_root, proj_root = Path(wt).resolve(), Path(proj).resolve()
+        def tree_blobs(ref: Optional[str]) -> Dict[str, str]:
+            blobs: Dict[str, str] = {}
+            if ref:
+                rc, out, _ = _git(["ls-tree", "-r", "-z", ref], str(proj_root))
+                if rc == 0:
+                    for rec in out.split("\0"):
+                        if "\t" in rec:
+                            meta, rel = rec.split("\t", 1)
+                            blobs[rel.replace("\\", "/")] = meta.split()[2]
+            return blobs
+
         origin = self.origin_ref(run_id)
-        origin_blobs: Dict[str, str] = {}
-        if origin:
-            rc, out, _ = _git(["ls-tree", "-r", "-z", origin], str(proj_root))
-            if rc == 0:
-                for rec in out.split("\0"):
-                    if "\t" in rec:
-                        meta, rel = rec.split("\t", 1)
-                        origin_blobs[rel.replace("\\", "/")] = meta.split()[2]
+        origin_blobs = tree_blobs(origin)
+        # This run's own starting snapshot. When a mission builds on an earlier mission's worktree, origin_ref walks
+        # back to the first run of that chain; if the earlier deliverable was applied to the project meanwhile, every
+        # file it created looks "changed in the project since the work started" relative to that origin. A project file
+        # identical to what THIS run started from was not touched by the user, so overwriting it loses nothing.
+        start_ref = (self._load(run_id, "source_snapshot.json") or {}).get("base_ref")
+        start_blobs = tree_blobs(start_ref) if start_ref and start_ref != origin else origin_blobs
         rc1, tracked, _ = _git(["ls-files", "-z"], str(wt_root))
         rc2, others, _ = _git(["ls-files", "--others", "--exclude-standard", "-z"], str(wt_root))
         if rc1 or rc2:
@@ -621,10 +631,11 @@ class ResultManager:
         for rel in candidates:
             src, dst = wt_root / rel, proj_root / rel
             src_blob, dst_blob, origin_blob = src_ids.get(rel), dst_ids.get(rel), origin_blobs.get(rel)
+            start_blob = start_blobs.get(rel)
             if dst_blob is not None:
                 if dst_blob == src_blob or src_blob == origin_blob:
                     unchanged += 1; continue                 # same already, or the AIs left it alone (user's version stays)
-                if dst_blob != origin_blob:
+                if dst_blob != origin_blob and dst_blob != start_blob:
                     conflicts.append({"path": rel, "reason": "changed in the project since the work started"}); continue
                 kind = "M"
             else:

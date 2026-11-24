@@ -114,6 +114,28 @@ def test_milestone_chain_resolves_to_the_project_snapshot_it_started_from(tmp_pa
     assert kinds == {"a.py": "M", "new.py": "A"}                                # both milestones are delivered
 
 
+def test_chain_after_earlier_milestone_was_applied_is_not_a_conflict(tmp_path, cleanup_runs):
+    """Milestone 1 is applied to the project, then milestone 2 (built on milestone 1's worktree) edits the same file.
+    The project file equals what milestone 2 started from, so it is a plain change, not a user conflict
+    (RUN-261124191214 was blocked on exactly this). A real user edit after that is still a conflict."""
+    proj = project(tmp_path)
+    base = snapshot(str(proj))
+    r1, r2 = "RUN-TEST-DLV5A", "RUN-TEST-DLV5B"; cleanup_runs += [r1, r2]
+    wt1 = fake_run(proj, r1, base)
+    (wt1 / "new.py").write_text("new = 1\n", encoding="utf-8")                # milestone 1 adds new.py
+    (proj / "new.py").write_text("new = 1\n", encoding="utf-8")               # ... and it is applied to the project
+    base2 = snapshot(str(wt1))
+    wt2 = fake_run(proj, r2, base2, base_worktree=str(wt1))
+    (wt2 / "new.py").write_text("new = 2\n", encoding="utf-8")                # milestone 2 changes it again
+    (wt2 / "cli.py").write_text("cli = 1\n", encoding="utf-8")
+    rm = ResultManager()
+    tree = rm.tree_manifest(r2)
+    assert tree["conflicts"] == []
+    assert {m["path"]: m["type"] for m in tree["manifest"]} == {"new.py": "M", "cli.py": "A"}
+    (proj / "new.py").write_text("new = 99\n", encoding="utf-8")              # the user edits it afterwards
+    assert [c["path"] for c in rm.tree_manifest(r2)["conflicts"]] == ["new.py"]
+
+
 def test_apply_tree_requires_full_pass_evidence(tmp_path, cleanup_runs):
     proj = project(tmp_path)
     rid = "RUN-TEST-DLV4"; cleanup_runs.append(rid)

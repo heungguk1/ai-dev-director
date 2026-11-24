@@ -49,7 +49,11 @@ async function pollRoles(){try{const r=await getJSON('/ops/roles');roleSettings=
 function assignment(){
   if(roleSettings&&!isLiveNow())return {HEAD:CLI[roleSettings.head],BUILDER:CLI[roleSettings.builder],REVIEWER:CLI[roleSettings.reviewer]};
   const a={...DEFAULT_ASSIGN},prov=(status&&status.providers)||{};
-  for(const [p,info] of Object.entries(prov))if(info&&ROLES.includes(info.role)&&AI[p])a[info.role]=p;
+  // one AI can hold several roles: /status then sends a combined string such as "HEAD, REVIEWER" (or "HEAD·REVIEWER")
+  for(const [p,info] of Object.entries(prov)){
+    if(!info||!AI[p])continue;
+    for(const r of String(info.role||'').replace(/·/g,',').split(',').map(s=>s.trim().toUpperCase()))if(ROLES.includes(r))a[r]=p;
+  }
   return a;
 }
 function isLiveNow(){const a=activity||{};return (a.working_now||[]).length>0||(a.missions||[]).some(m=>m.live);}
