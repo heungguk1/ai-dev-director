@@ -289,7 +289,8 @@ class ResultManager:
         }
 
     def pending_results(self) -> List[Dict[str, Any]]:
-        """READY results from the persisted result_state table only (no run scan, no git)."""
+        """Results still waiting for a decision (READY, or an apply that was blocked / rolled back and can be retried),
+        from the persisted result_state table only (no run scan, no git)."""
         out = []
         for r in self.sm.list_pending_results():
             if str(r.get("run_id", "")).startswith("RUN-TEST-"):
@@ -570,6 +571,18 @@ class ResultManager:
             rid = Path(base).name                          # a worktree is named after its run
         return None
 
+    def chain_refs(self, run_id: str) -> List[str]:
+        """Every project snapshot a chain of milestones passed through (this run's base_ref first, the origin last)."""
+        refs, seen, rid = [], set(), run_id
+        while rid and rid not in seen:
+            seen.add(rid)
+            snap = self._load(rid, "source_snapshot.json") or {}
+            if snap.get("base_ref") and snap["base_ref"] not in refs:
+                refs.append(snap["base_ref"])
+            base = snap.get("base_worktree") or (self._load(rid, "mission_base.json") or {}).get("base_worktree")
+            rid = Path(base).name if base else None
+        return refs
+
     @staticmethod
     def _git_blob_ids(root: Path, rels: List[str]) -> Dict[str, str]:
         """Blob ids exactly as git would store these working files (line-ending conversion included), in one call."""
@@ -601,12 +614,15 @@ class ResultManager:
 
         origin = self.origin_ref(run_id)
         origin_blobs = tree_blobs(origin)
-        # This run's own starting snapshot. When a mission builds on an earlier mission's worktree, origin_ref walks
-        # back to the first run of that chain; if the earlier deliverable was applied to the project meanwhile, every
-        # file it created looks "changed in the project since the work started" relative to that origin. A project file
-        # identical to what THIS run started from was not touched by the user, so overwriting it loses nothing.
-        start_ref = (self._load(run_id, "source_snapshot.json") or {}).get("base_ref")
-        start_blobs = tree_blobs(start_ref) if start_ref and start_ref != origin else origin_blobs
+        # Every snapshot the chain passed through. When a mission builds on an earlier milestone's worktree, origin_ref
+        # walks back to the first run; if an earlier deliverable of that chain (any of them, not only the latest) was
+        # applied to the project meanwhile, its files look "changed in the project since the work started" relative to
+        # that origin. A project file identical to one of the chain's own snapshots was not edited by the user, so the
+        # finished version can replace it without losing anything.
+        chain_blobs: Dict[str, set] = {}
+        for ref in self.chain_refs(run_id):
+            for rel, blob in (origin_blobs if ref == origin else tree_blobs(ref)).items():
+                chain_blobs.setdefault(rel, set()).add(blob)
         rc1, tracked, _ = _git(["ls-files", "-z"], str(wt_root))
         rc2, others, _ = _git(["ls-files", "--others", "--exclude-standard", "-z"], str(wt_root))
         if rc1 or rc2:
@@ -631,11 +647,10 @@ class ResultManager:
         for rel in candidates:
             src, dst = wt_root / rel, proj_root / rel
             src_blob, dst_blob, origin_blob = src_ids.get(rel), dst_ids.get(rel), origin_blobs.get(rel)
-            start_blob = start_blobs.get(rel)
             if dst_blob is not None:
                 if dst_blob == src_blob or src_blob == origin_blob:
                     unchanged += 1; continue                 # same already, or the AIs left it alone (user's version stays)
-                if dst_blob != origin_blob and dst_blob != start_blob:
+                if dst_blob != origin_blob and dst_blob not in chain_blobs.get(rel, ()):
                     conflicts.append({"path": rel, "reason": "changed in the project since the work started"}); continue
                 kind = "M"
             else:

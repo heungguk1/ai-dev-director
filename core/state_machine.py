@@ -377,7 +377,8 @@ class StateMachine:
                 """
                 SELECT r.run_id, r.project_path, r.created_at, s.state, s.changed_count, s.tests_state, s.reviewer_state, s.safety_state, s.worktree_state
                 FROM result_state s JOIN runs r ON r.run_id = s.run_id
-                WHERE s.state = 'READY' AND r.current_state = 'PASS' AND s.worktree_state = 'PRESENT'
+                WHERE s.state IN ('READY', 'APPLY_BLOCKED', 'APPLY_FAILED_ROLLED_BACK', 'APPLY_VERIFY_FAILED_ROLLED_BACK')
+                  AND r.current_state = 'PASS' AND s.worktree_state = 'PRESENT'
                 ORDER BY r.created_at DESC
                 """).fetchall()
             return [dict(r) for r in rows]

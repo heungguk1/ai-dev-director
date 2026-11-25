@@ -136,6 +136,28 @@ def test_chain_after_earlier_milestone_was_applied_is_not_a_conflict(tmp_path, c
     assert [c["path"] for c in rm.tree_manifest(r2)["conflicts"]] == ["new.py"]
 
 
+def test_project_holding_an_older_milestone_of_the_chain_is_not_a_conflict(tmp_path, cleanup_runs):
+    """Chain 1 -> 2 -> 3. Only milestone 1 was applied; 2 and 3 changed the same file further. The project file equals
+    a snapshot of the chain (not the origin, not milestone 3's start), so it is a plain change. Skipping it as a
+    "conflict" left a half-applied result whose tests failed (RUN-261124214228 was rolled back on exactly this)."""
+    proj = project(tmp_path)
+    base = snapshot(str(proj))
+    r1, r2, r3 = "RUN-TEST-DLV6A", "RUN-TEST-DLV6B", "RUN-TEST-DLV6C"; cleanup_runs += [r1, r2, r3]
+    wt1 = fake_run(proj, r1, base)
+    (wt1 / "cli.py").write_text("cli = 1\n", encoding="utf-8")
+    (proj / "cli.py").write_text("cli = 1\n", encoding="utf-8")               # milestone 1 applied
+    wt2 = fake_run(proj, r2, snapshot(str(wt1)), base_worktree=str(wt1))
+    (wt2 / "cli.py").write_text("cli = 2\n", encoding="utf-8")
+    wt3 = fake_run(proj, r3, snapshot(str(wt2)), base_worktree=str(wt2))
+    (wt3 / "web.py").write_text("web = 1\n", encoding="utf-8")
+    rm = ResultManager()
+    tree = rm.tree_manifest(r3)
+    assert tree["conflicts"] == []
+    assert {m["path"]: m["type"] for m in tree["manifest"]} == {"cli.py": "M", "web.py": "A"}
+    (proj / "cli.py").write_text("cli = 99\n", encoding="utf-8")              # a real user edit is still a conflict
+    assert [c["path"] for c in rm.tree_manifest(r3)["conflicts"]] == ["cli.py"]
+
+
 def test_apply_tree_requires_full_pass_evidence(tmp_path, cleanup_runs):
     proj = project(tmp_path)
     rid = "RUN-TEST-DLV4"; cleanup_runs.append(rid)
