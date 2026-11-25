@@ -97,6 +97,7 @@ def test_apply_tree_delivers_into_the_project_and_blocks_on_conflicts(tmp_path, 
     assert (proj / "b.py").read_text(encoding="utf-8") == "b = 99\n"           # the user's edit survives
     assert [c["path"] for c in done["skipped_conflicts"]] == ["b.py"]
     assert rm.apply_tree(rid, request_id="dlv2-c")["status"] == "blocked"      # already applied
+    assert rm.result_state(rid)["state"] == "APPLIED"                          # a second click keeps the outcome
 
 
 def test_milestone_chain_resolves_to_the_project_snapshot_it_started_from(tmp_path, cleanup_runs):

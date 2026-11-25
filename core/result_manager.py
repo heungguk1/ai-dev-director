@@ -85,6 +85,13 @@ class ResultManager:
         except Exception:
             pass
 
+    def _mark_blocked(self, run_id: str, blocks: List[str], request_id: str) -> None:
+        """A refused apply never overwrites a final outcome: a second click after a successful apply is refused with
+        "Result already APPLIED", and the result must still read APPLIED (the audit log keeps the refusal)."""
+        if self.result_state(run_id).get("state") in (RESULT_APPLIED, RESULT_DISCARDED):
+            return
+        self._set_state(run_id, RESULT_BLOCKED, "; ".join(blocks), request_id)
+
     def record_summary(self, run_id: str) -> Optional[Dict[str, Any]]:
         """Computes the dashboard summary for a PASS run ONCE (one git status) and persists it to result_state.
         /status then reads the row; no subprocess per poll."""
@@ -428,7 +435,7 @@ class ResultManager:
         if not pre["ok"]:
             with _APPLY_LOCK:
                 _RECENT_APPLY_REQUESTS[rid] = "blocked"
-            self._set_state(run_id, RESULT_BLOCKED, "; ".join(pre["blocks"]), rid)
+            self._mark_blocked(run_id, pre["blocks"], rid)
             self.sm.log_audit(run_id, applied_by, "RESULT_APPLY_BLOCKED", json.dumps({"blocks": pre["blocks"], "request_id": rid}, ensure_ascii=False))
             return {"status": "blocked", "run_id": run_id, "blocks": pre["blocks"], "request_id": rid}
         proj = pre["project_path"]; key = _project_key(proj)
@@ -712,7 +719,7 @@ class ResultManager:
         if not pre["ok"]:
             with _APPLY_LOCK:
                 _RECENT_APPLY_REQUESTS[rid] = "blocked"
-            self._set_state(run_id, RESULT_BLOCKED, "; ".join(pre["blocks"]), rid)
+            self._mark_blocked(run_id, pre["blocks"], rid)
             self.sm.log_audit(run_id, applied_by, "RESULT_APPLY_BLOCKED", json.dumps({"blocks": pre["blocks"], "request_id": rid}, ensure_ascii=False))
             return {"status": "blocked", "run_id": run_id, "blocks": pre["blocks"], "conflicts": pre["conflicts"], "request_id": rid}
         proj = pre["project_path"]; key = _project_key(proj)
